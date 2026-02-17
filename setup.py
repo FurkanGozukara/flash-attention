@@ -68,7 +68,7 @@ NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
-    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
+    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "75;80;86;89;90;100;103;110;120;121").split(";")
 
 
 def get_platform():
@@ -98,15 +98,33 @@ def get_cuda_bare_metal_version(cuda_dir):
 def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
     """
     Adds -gencode flags based on nvcc capabilities:
-      - sm_80/90 (regular)
+      - sm_75 (Turing) on CUDA >= 11.7
+      - sm_80 (Ampere A100) always included
+      - sm_86 (Ampere RTX 30xx) on CUDA >= 11.1
+      - sm_89 (Ada Lovelace) on CUDA >= 11.8
+      - sm_90 (Hopper) on CUDA >= 11.8
       - sm_100/120 on CUDA >= 12.8
-      - Use 100f on CUDA >= 12.9 (Blackwell family-specific)
-      - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
+      - sm_103 on CUDA >= 13.0
+      - sm_110 on CUDA >= 13.0 (or sm_101 on CUDA 12.8-12.9)
+      - sm_121 on CUDA >= 13.0
+      - Use 100f/103f/110f/120f on CUDA >= 12.9 (feature-conditional)
       - Embed PTX for newest arch for forward compatibility
     """
-    # Always-regular 80
+    # Turing 7.5 (T4, RTX 2080) needs >= 11.7 (we already require 11.7 minimum)
+    if "75" in archs:
+        cc_flag += ["-gencode", "arch=compute_75,code=sm_75"]
+
+    # Ampere 8.0 (A100)
     if "80" in archs:
         cc_flag += ["-gencode", "arch=compute_80,code=sm_80"]
+
+    # Ampere 8.6 (RTX 3060/3070/3080/3090) needs >= 11.1
+    if bare_metal_version >= Version("11.1") and "86" in archs:
+        cc_flag += ["-gencode", "arch=compute_86,code=sm_86"]
+
+    # Ada Lovelace 8.9 (RTX 4090) needs >= 11.8
+    if bare_metal_version >= Version("11.8") and "89" in archs:
+        cc_flag += ["-gencode", "arch=compute_89,code=sm_89"]
 
     # Hopper 9.0 needs >= 11.8
     if bare_metal_version >= Version("11.8") and "90" in archs:
@@ -128,7 +146,6 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
             else:
                 cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
 
-
         # Thor rename: 12.9 uses sm_101; 13.0+ uses sm_110
         if "110" in archs:
             if bare_metal_version >= Version("13.0"):
@@ -139,11 +156,26 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
                     cc_flag += ["-gencode", "arch=compute_101,code=sm_101"]
                 # else: no Thor support in older toolkits
 
+    # Next-gen architectures requiring CUDA >= 13.0
+    if bare_metal_version >= Version("13.0"):
+        if "103" in archs:
+            cc_flag += ["-gencode", "arch=compute_103f,code=sm_103"]
+        
+        if "121" in archs:
+            # 121 is PTX-only for forward compatibility
+            cc_flag += ["-gencode", "arch=compute_121,code=compute_121"]
+
     # PTX for newest requested arch (forward-compat)
-    numeric = [a for a in archs if a.isdigit()]
-    if numeric:
-        newest = max(numeric, key=int)
-        cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
+    # Special handling: if 121 is requested and present, use it as PTX target
+    # Otherwise, use the newest numeric architecture
+    if "121" in archs and bare_metal_version >= Version("13.0"):
+        # 121 already added above as PTX-only, no need to add again
+        pass
+    else:
+        numeric = [a for a in archs if a.isdigit()]
+        if numeric:
+            newest = max(numeric, key=int)
+            cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
 
     return cc_flag
 
@@ -572,20 +604,35 @@ class NinjaBuildExtension(BuildExtension):
             import psutil
 
             nvcc_threads = max(1, int(NVCC_THREADS))
+            
+            # Count number of architectures being compiled
+            num_archs = len(cuda_archs())
 
             # calculate the maximum allowed NUM_JOBS based on cores
             max_num_jobs_cores = max(1, os.cpu_count() // 2)
 
             # calculate the maximum allowed NUM_JOBS based on free memory
             free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
-            # Assume worst-case peak observed memory usage of ~5GB per NVCC thread.
-            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= free_memory.
-            max_num_jobs_memory = max(1, int(free_memory_gb / (5 * nvcc_threads)))
+            # Base memory usage is ~5GB per NVCC thread, but when compiling for many architectures,
+            # memory usage increases. Adjust memory estimate based on number of architectures:
+            # - 1-3 archs: 5GB per thread (baseline)
+            # - 4-6 archs: 7GB per thread 
+            # - 7+ archs: 9GB per thread
+            if num_archs <= 3:
+                memory_per_thread_gb = 5
+            elif num_archs <= 6:
+                memory_per_thread_gb = 7
+            else:
+                memory_per_thread_gb = 9
+            
+            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * memory_per_thread_gb <= free_memory.
+            max_num_jobs_memory = max(1, int(free_memory_gb / (memory_per_thread_gb * nvcc_threads)))
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
             max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
             print(
                 f"Auto set MAX_JOBS to `{max_jobs}`, NVCC_THREADS to `{nvcc_threads}`. "
+                f"Compiling for {num_archs} architectures with {memory_per_thread_gb}GB memory estimate per thread. "
                 "If you see memory pressure, please use a lower `MAX_JOBS=N` or `NVCC_THREADS=N` value."
             )
             os.environ["MAX_JOBS"] = str(max_jobs)
