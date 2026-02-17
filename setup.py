@@ -110,25 +110,33 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
       - Use 100f/103f/110f/120f on CUDA >= 12.9 (feature-conditional)
       - Embed PTX for newest arch for forward compatibility
     """
+    # Track which architectures were actually added
+    added_archs = []
+    
     # Turing 7.5 (T4, RTX 2080) needs >= 11.7 (we already require 11.7 minimum)
     if "75" in archs:
         cc_flag += ["-gencode", "arch=compute_75,code=sm_75"]
+        added_archs.append("75")
 
     # Ampere 8.0 (A100)
     if "80" in archs:
         cc_flag += ["-gencode", "arch=compute_80,code=sm_80"]
+        added_archs.append("80")
 
     # Ampere 8.6 (RTX 3060/3070/3080/3090) needs >= 11.1
     if bare_metal_version >= Version("11.1") and "86" in archs:
         cc_flag += ["-gencode", "arch=compute_86,code=sm_86"]
+        added_archs.append("86")
 
     # Ada Lovelace 8.9 (RTX 4090) needs >= 11.8
     if bare_metal_version >= Version("11.8") and "89" in archs:
         cc_flag += ["-gencode", "arch=compute_89,code=sm_89"]
+        added_archs.append("89")
 
     # Hopper 9.0 needs >= 11.8
     if bare_metal_version >= Version("11.8") and "90" in archs:
         cc_flag += ["-gencode", "arch=compute_90,code=sm_90"]
+        added_archs.append("90")
 
     # Blackwell 10.x requires >= 12.8
     if bare_metal_version >= Version("12.8"):
@@ -138,6 +146,7 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
                 cc_flag += ["-gencode", "arch=compute_100f,code=sm_100"]
             else:
                 cc_flag += ["-gencode", "arch=compute_100,code=sm_100"]
+            added_archs.append("100")
 
         if "120" in archs:
             # sm_120 is supported in CUDA 12.8/12.9+ toolkits
@@ -145,36 +154,40 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
                 cc_flag += ["-gencode", "arch=compute_120f,code=sm_120"]
             else:
                 cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
+            added_archs.append("120")
 
         # Thor rename: 12.9 uses sm_101; 13.0+ uses sm_110
         if "110" in archs:
             if bare_metal_version >= Version("13.0"):
                 cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
+                added_archs.append("110")
             else:
                 # Provide Thor support for CUDA 12.9 via sm_101
                 if bare_metal_version >= Version("12.8"):
                     cc_flag += ["-gencode", "arch=compute_101,code=sm_101"]
+                    added_archs.append("101")
                 # else: no Thor support in older toolkits
 
     # Next-gen architectures requiring CUDA >= 13.0
     if bare_metal_version >= Version("13.0"):
         if "103" in archs:
             cc_flag += ["-gencode", "arch=compute_103f,code=sm_103"]
+            added_archs.append("103")
         
         if "121" in archs:
             # 121 is PTX-only for forward compatibility
             cc_flag += ["-gencode", "arch=compute_121,code=compute_121"]
+            added_archs.append("121")
 
     # PTX for newest requested arch (forward-compat)
-    # Special handling: if 121 is requested and present, use it as PTX target
-    # Otherwise, use the newest numeric architecture
-    if "121" in archs and bare_metal_version >= Version("13.0"):
+    # Special handling: if 121 is requested and was added, it's already PTX-only
+    # Otherwise, use the newest numeric architecture that was actually added
+    if "121" in added_archs:
         # 121 already added above as PTX-only, no need to add again
         pass
     else:
-        numeric = [a for a in archs if a.isdigit()]
-        if numeric:
-            newest = max(numeric, key=int)
+        if added_archs:
+            newest = max(added_archs, key=int)
             cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
 
     return cc_flag
