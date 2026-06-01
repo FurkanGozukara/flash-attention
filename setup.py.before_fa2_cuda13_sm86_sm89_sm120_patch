@@ -99,63 +99,57 @@ def get_cuda_bare_metal_version(cuda_dir):
 
 
 def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
-    requested = set()
-    for arch in archs:
-        arch = str(arch).strip().lower().replace(".", "")
-        if arch.endswith("+ptx"):
-            arch = arch[:-4]
-        if arch:
-            requested.add(arch)
+    """
+    Adds -gencode flags based on nvcc capabilities:
+      - sm_80/90 (regular)
+      - sm_100/120 on CUDA >= 12.8
+      - Use 100f on CUDA >= 12.9 (Blackwell family-specific)
+      - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
+      - Embed PTX for newest arch for forward compatibility
+    """
+    # Always-regular 80
+    if "80" in archs:
+        cc_flag += ["-gencode", "arch=compute_80,code=sm_80"]
 
-    min_cuda = {
-        "90": Version("11.8"),
-        "90a": Version("11.8"),
-        "100": Version("12.8"),
-        "100a": Version("12.8"),
-        "103": Version("12.8"),
-        "103a": Version("12.8"),
-        "110": Version("13.0"),
-        "110a": Version("13.0"),
-        "120": Version("12.8"),
-        "120a": Version("12.8"),
-        "121": Version("13.0"),
-        "121a": Version("13.0"),
-    }
+    # Hopper 9.0 needs >= 11.8
+    if bare_metal_version >= Version("11.8") and "90" in archs:
+        cc_flag += ["-gencode", "arch=compute_90,code=sm_90"]
 
-    def add(arch):
-        if arch not in requested:
-            return
-        if bare_metal_version < min_cuda.get(arch, Version("11.0")):
-            return
-        cc_flag.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
+    # Blackwell 10.x requires >= 12.8
+    if bare_metal_version >= Version("12.8"):
+        if "100" in archs:
+            # CUDA 12.9 introduced "family-specific" for Blackwell (100f)
+            if bare_metal_version >= Version("12.9"):
+                cc_flag += ["-gencode", "arch=compute_100f,code=sm_100"]
+            else:
+                cc_flag += ["-gencode", "arch=compute_100,code=sm_100"]
 
-    for arch in (
-        "80",
-        "86",
-        "87",
-        "88",
-        "89",
-        "90",
-        "90a",
-        "100",
-        "100a",
-        "103",
-        "103a",
-        "110",
-        "110a",
-        "120",
-        "120a",
-        "121",
-        "121a",
-    ):
-        add(arch)
+        if "120" in archs:
+            # sm_120 is supported in CUDA 12.8/12.9+ toolkits
+            if bare_metal_version >= Version("12.9"):
+                cc_flag += ["-gencode", "arch=compute_120f,code=sm_120"]
+            else:
+                cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
 
-    numeric = [a for a in requested if a.isdigit()]
+
+        # Thor rename: 12.9 uses sm_101; 13.0+ uses sm_110
+        if "110" in archs:
+            if bare_metal_version >= Version("13.0"):
+                cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
+            else:
+                # Provide Thor support for CUDA 12.9 via sm_101
+                if bare_metal_version >= Version("12.8"):
+                    cc_flag += ["-gencode", "arch=compute_101,code=sm_101"]
+                # else: no Thor support in older toolkits
+
+    # PTX for newest requested arch (forward-compat)
+    numeric = [a for a in archs if a.isdigit()]
     if numeric:
         newest = max(numeric, key=int)
-        if bare_metal_version >= min_cuda.get(newest, Version("11.0")):
-            cc_flag.extend(["-gencode", f"arch=compute_{newest},code=compute_{newest}"])
+        cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
+
     return cc_flag
+
 
 def get_hip_version():
     return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
